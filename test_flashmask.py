@@ -144,7 +144,7 @@ def test_flashmask(
     if fa_version == 4 and d != 128 and d != 64 and seqlen_q != seqlen_k and causal:
       pytest.skip(f"Skipping because running fa4 in causal when seqlen_q != seqlen_k and d not int [128, 64]")
 
-    if fa_version == 4 and startend_row_indices.shape[-1] == 4:
+    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
       pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
 
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
