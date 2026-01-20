@@ -4,7 +4,11 @@ import itertools
 import pytest
 from einops import rearrange, repeat
 import paddle
-from paddle.nn.functional.flash_attention import flashmask_attention
+try:
+    from flash_mask.cute.interface import flashmask_attention
+except (ImportError, ModuleNotFoundError):
+    from paddle.nn.functional.flash_attention import flashmask_attention
+
 from generate_startend_row_indices import (
   startend_row_indices_to_attn_bias,
   generate_none_mask,
@@ -31,10 +35,17 @@ shape_cases = (
         # (2, 8192, 8192, 32, 4), # this will oom
         (2, 8192, 8192, 14, 1),
         (2, 16384, 16384, 4, 1),
+        (1, 1, 127, 1, 1),
         (1, 128, 127, 1, 1),
         (1, 127, 128, 1, 1),
         (2, 16383, 16384, 4, 1),
         (2, 16384, 16383, 4, 1),
+        (2, 1000, 1000, 4, 1),
+        (2, 2000, 2000, 4, 1),
+        (2, 3000, 3000, 4, 1),
+        (1, 4000, 4000, 1, 1),
+        (1, 8192, 32768+1024, 2, 1),
+        (1, 8192, 16384+1024, 2, 1)
         # my case
     ]
     # tridao case
@@ -57,14 +68,17 @@ shape_cases = (
 # Generate all combinations for second param
 def generate_shapes():
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv in shape_cases:
-        nheads_startend_row_indices_values = [1, nheads_kv]
+        if nheads_kv == 1:
+          nheads_startend_row_indices_values = [1]
+        else:
+          nheads_startend_row_indices_values = [1, nheads_kv]
         for nheads_startend_row_indices in nheads_startend_row_indices_values:
             yield (
                 batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices
             )
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
-@pytest.mark.parametrize("fa_version", [3])
+@pytest.mark.parametrize("fa_version", [2, 3, 4])
 @pytest.mark.parametrize("d, dv",
     [
         (64, 64),
@@ -121,8 +135,17 @@ def test_flashmask(
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
-    if startend_row_indices is None and causal and d in (80, 192):
-      pytest.skip(f"Skipping because running headdim {d} with flash_attn in causal mask")
+    if startend_row_indices is None and causal and d == 80:
+      pytest.skip(f"Skipping because running headdim 80 with flash_attn in causal mask")
+
+    if fa_version == 2 and seqlen_q != seqlen_k and causal:
+      pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
+
+    if fa_version == 4 and d != 128 and d != 64 and seqlen_q != seqlen_k and causal:
+      pytest.skip(f"Skipping because running fa4 in causal when seqlen_q != seqlen_k and d not int [128, 64]")
+
+    if fa_version == 4 and startend_row_indices.shape[-1] == 4:
+      pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
 
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
@@ -156,6 +179,8 @@ def test_flashmask(
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
     elif fa_version == 3:
         paddle.set_flags({'FLAGS_flash_attn_version': 3})
+    elif fa_version == 4:
+        paddle.set_flags({'FLAGS_flash_attn_version': 4})
     else:
         raise ValueError(
             f"Invalid flash attention version: {fa_version}"
