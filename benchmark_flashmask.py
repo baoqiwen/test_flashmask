@@ -5,7 +5,10 @@ from typing import Optional, List
 from tabulate import tabulate
 import time
 import paddle
-from paddle.nn.functional.flash_attention import flashmask_attention
+try:
+    from flash_mask.cute.interface import flashmask_attention
+except (ImportError, ModuleNotFoundError):
+    from paddle.nn.functional.flash_attention import flashmask_attention
 import random
 import os
 
@@ -139,13 +142,56 @@ def test_mask(
     sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
     density = 1.0 - sparsity 
 
-    flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal)
+    flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal, return_softmax_lse=True)
 
-    fwd_time_ms = do_bench(flashmask)
+    fa_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
 
-    flashmask_out = flashmask()
+    if fa_version == 4:
+        query.stop_gradient = True
+        key.stop_gradient = True
+        value.stop_gradient = True
+        def flashmask_fwd():
+            from flash_mask.cute.interface import _flash_attn_fwd
+            out, lse = _flash_attn_fwd(
+                query,
+                key,
+                value,
+                causal=causal,
+                softmax_scale=None,
+                return_lse=True,
+                startend_row_indices=startend_row_indices,
+                pack_gqa=False,
+            )
+        fwd_time_ms = do_bench(flashmask_fwd)
+    else:
+        fwd_time_ms = do_bench(flashmask)
 
-    bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True))
+    flashmask_out, lse = flashmask()
+
+    if fa_version == 4:
+        def flashmask_bwd():
+            from flash_mask.cute import flashmask_utils as fm
+            from flash_mask.cute.interface import _flash_attn_bwd
+            flashmask_info = None
+            if startend_row_indices is not None:
+                flashmask_info = fm.FlashMaskInfoPaddle(
+                    startend_row_indices=startend_row_indices,
+                    is_causal=causal,
+                )
+            fm4_query_grad, fm4_key_grad, fm4_value_grad = _flash_attn_bwd(
+                query,
+                key,
+                value,
+                flashmask_out,
+                gradOut,
+                lse,
+                flashmask_info,
+                causal=causal,
+            )
+
+        bwd_time_ms = do_bench(flashmask_bwd)
+    else:
+        bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True))
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
@@ -547,8 +593,10 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
     elif fm_version == 3:
         paddle.set_flags({'FLAGS_flash_attn_version': 3})
+    elif fm_version == 4:
+        paddle.set_flags({'FLAGS_flash_attn_version': 4})
     else:
-        raise ArgumentError(f"fm_version must be 1 or 3, but got {fm_version}")
+        raise ArgumentError(f"fm_version must be 1 or 3 or 4, but got {fm_version}")
     total_length = 0
     doc_seq_lens_list = []
     with open('kernel_test_seq_info.txt', 'r') as f:
@@ -564,7 +612,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [64, 128, 256]:
+        for D in [64, 128] if fm_version == 4 else [64, 128, 256]:
             H = 4096 // D
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
