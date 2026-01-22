@@ -1,3 +1,8 @@
+# run this to check aadiff:
+# python -m pytest -v test_fwd_md5sum.py
+#
+# run this to record the fwd md5sum (only necessary when you want to update ground truth):
+# python test_fwd_md5sum.py
 import os
 import json
 import itertools
@@ -21,22 +26,28 @@ from generate_startend_row_indices import (
     generate_random_eviction_mask
 )
 from test_util import attention_ref
-from paddle.nn.functional.flash_attention import flashmask_attention
+try:
+    from flash_mask.cute.interface import flashmask_attention
+except (ImportError, ModuleNotFoundError):
+    from paddle.nn.functional.flash_attention import flashmask_attention
 
-GEN_FUNCTIONS = [
-    # partial(generate_none_mask, causal=False),
-    # partial(generate_none_mask, causal=True),
-    partial(generate_sliding_window_mask),
-    partial(generate_causal_document_mask),
-    partial(generate_document_mask),
-    partial(generate_share_question_mask),
-    partial(generate_global_sliding_window_mask),
-    partial(generate_causal_blockwise_mask),
-    partial(generate_prefix_lm_document_mask),
-    partial(generate_prefix_lm_causal_mask),
-    partial(generate_qk_sparse_mask),
-    partial(generate_random_eviction_mask),
-]
+GEN_FUNCTIONS_DICT = {
+    "full": partial(generate_none_mask, causal=False),
+    "causal": partial(generate_none_mask, causal=True),
+    "sliding_window": partial(generate_sliding_window_mask),
+    "causal_document": partial(generate_causal_document_mask),
+    "document": partial(generate_document_mask),
+    "share_question": partial(generate_share_question_mask),
+    "global_sliding_window": partial(generate_global_sliding_window_mask),
+    "causal_blockwise": partial(generate_causal_blockwise_mask),
+    "prefix_lm_document_mask": partial(generate_prefix_lm_document_mask),
+    "prefix_lm_causal": partial(generate_prefix_lm_causal_mask),
+    "qk_sparse": partial(generate_qk_sparse_mask),
+    "random_eviction": partial(generate_random_eviction_mask),
+}
+
+fa_versions = [2, 3, 4]
+d_dv_combinations = [(64, 64), (80, 80), (128, 128), (192, 192), (256, 256)]
 
 def record_gt(output_file="flashmask_gt.json"):
     gt_records = {}
@@ -55,7 +66,7 @@ def record_gt(output_file="flashmask_gt.json"):
             if (i + 1) % 10 == 0:
                 print(f"{i+1}/{len(param_combinations)} test cases recorded")
                 
-        except Exception as e:
+        except pytest.skip.Exception as e:
             print(f"Skipping test case due to exception: {params}: {e}")
             continue
     gt_records["gt_commit_id"] = input("Please input the commit ID of fwd GT md5sum: ")
@@ -68,7 +79,7 @@ def record_gt(output_file="flashmask_gt.json"):
 
 
 def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
-                         nheads_startend_row_indices, fa_version, dtype, 
+                         nheads_startend_row_indices, fa_version, dtype, mask_type,
                          gen_startend_row_indices, softcap=0.0):
     paddle.seed(2024)
     np.random.seed(2024)
@@ -85,10 +96,18 @@ def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, 
     if startend_row_indices is None and causal and d in (80, 192):
         pytest.skip(f"Skipping because running headdim {d} with flash_attn in causal mask")
 
+    if fa_version == 4 and causal and seqlen_q != seqlen_k and d not in [64, 128]:
+        pytest.skip(f"Skipping because running headdim {d} with fa4 in causal")
+
+    if fa_version == 4 and mask_type == "global_sliding_window":
+        pytest.skip(f"Skipping because running fa4 in global_sliding_window")
+
     if fa_version == 2:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
     elif fa_version == 3:
         paddle.set_flags({'FLAGS_flash_attn_version': 3})
+    elif fa_version == 4:
+        paddle.set_flags({'FLAGS_flash_attn_version': 4})
     else:
         raise ValueError(f"Invalid flash attention version: {fa_version}")
 
@@ -124,14 +143,12 @@ def generate_all_param_combinations():
     combinations = []
     
     dtypes = [paddle.bfloat16]
-    fa_versions = [3]
-    d_dv_combinations = [(64, 64), (80, 80), (128, 128), (192, 192), (256, 256)]
     
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices in generate_shapes():
         for dtype in dtypes:
             for fa_version in fa_versions:
                 for d, dv in d_dv_combinations:
-                    for gen_func in GEN_FUNCTIONS:
+                    for mask_type, gen_func in GEN_FUNCTIONS_DICT.items():
                         params = {
                             'batch_size': batch_size,
                             'seqlen_q': seqlen_q,
@@ -143,6 +160,7 @@ def generate_all_param_combinations():
                             'nheads_startend_row_indices': nheads_startend_row_indices,
                             'fa_version': fa_version,
                             'dtype': dtype,
+                            'mask_type': mask_type,
                             'gen_startend_row_indices': gen_func,
                             'softcap': 0.0
                         }
@@ -152,7 +170,6 @@ def generate_all_param_combinations():
 
 
 def generate_param_key(params):
-    gen_func_index = get_gen_func_index(params['gen_startend_row_indices'])
     nheads_startend = params['nheads_startend_row_indices']
     dtype_index = get_dtype_index(params['dtype'])
     
@@ -161,18 +178,10 @@ def generate_param_key(params):
     else:
         nheads_startend_str = str(nheads_startend)
     
-    return (f"gen_startend_row_indices{gen_func_index}-"
+    return (f"{params['mask_type']}-"
             f"{params['batch_size']}-{params['seqlen_q']}-{params['seqlen_k']}-"
             f"{params['nheads']}-{params['nheads_kv']}-{nheads_startend_str}-"
             f"{params['d']}-{params['dv']}-{params['fa_version']}-dtype{dtype_index}")
-
-
-def get_gen_func_index(gen_func):
-    for i, func in enumerate(GEN_FUNCTIONS):
-        if gen_func == func or (hasattr(gen_func, 'func') and gen_func.func == func.func):
-            return i
-    return -1
-
 
 def get_dtype_index(dtype):
     dtype_list = [paddle.bfloat16]
@@ -191,26 +200,19 @@ except FileNotFoundError:
 
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
-@pytest.mark.parametrize("fa_version", [3])
-@pytest.mark.parametrize("d, dv",
-    [
-        (64, 64),
-        (80, 80),
-        (128, 128),
-        (192, 192),
-        (256, 256),
-    ])
+@pytest.mark.parametrize("fa_version", fa_versions)
+@pytest.mark.parametrize("d, dv", d_dv_combinations)
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
     list(generate_shapes())
 )
 @pytest.mark.parametrize(
-    "gen_startend_row_indices",
-    GEN_FUNCTIONS,
+    "mask_type, gen_startend_row_indices",
+    list(GEN_FUNCTIONS_DICT.items()),
 )
 def test_flashmask_md5(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
-    nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
+    nheads_startend_row_indices, fa_version, dtype, mask_type, gen_startend_row_indices, softcap=0.0
 ):
     params = {
         'batch_size': batch_size,
@@ -223,6 +225,7 @@ def test_flashmask_md5(
         'nheads_startend_row_indices': nheads_startend_row_indices,
         'fa_version': fa_version,
         'dtype': dtype,
+        'mask_type': mask_type,
         'gen_startend_row_indices': gen_startend_row_indices,
         'softcap': softcap
     }
