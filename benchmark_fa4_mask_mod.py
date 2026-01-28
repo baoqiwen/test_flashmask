@@ -319,16 +319,15 @@ def generate_sliding_window(window_size: int):
         seqlen_info,
         aux_tensors,
     ):
-        window_size = utils.scalar_to_ssa(aux_tensors[0][0], cutlass.Int32)
+        window_size_cute = utils.scalar_to_ssa(window_size, cutlass.Int32)
         offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
         offset_ssa = utils.scalar_to_ssa(offset, cutlass.Int32)
-        return (m_idx - n_idx <= window_size) & (n_idx <= (m_idx + offset_ssa))
+        return (m_idx - n_idx <= window_size_cute) & (n_idx <= (m_idx + offset_ssa))
 
-    window_size_tensor = torch.tensor(window_size, dtype=torch.int32, device="cuda").unsqueeze(0)
     return {
         "cute_mask_mod": cute_sliding_window,
         "flex_mask_mod": sliding_window_mask,
-        "aux_tensors": [window_size_tensor],
+        "aux_tensors": None,
         "causal": True,
     }
 
@@ -492,19 +491,15 @@ def generate_global_sliding_window_mask(B=16, S=8192, global_token=16, window_si
         seqlen_info,
         aux_tensors,
     ) -> cute.TensorSSA:
-        left_window_size = utils.scalar_to_ssa(aux_tensors[0][0], cutlass.Int32)
-        right_window_size = utils.scalar_to_ssa(aux_tensors[1][0], cutlass.Int32)
-        global_token = utils.scalar_to_ssa(aux_tensors[2][0], cutlass.Int32)
-        return ((m_idx >= n_idx) & ((m_idx - n_idx <= (left_window_size)) | (n_idx < global_token))) | ((n_idx >= m_idx) & ((n_idx - m_idx <= (right_window_size)) | (m_idx < global_token)))
+        left_window_size_cute = utils.scalar_to_ssa(left_window_size, cutlass.Int32)
+        right_window_size_cute = utils.scalar_to_ssa(right_window_size, cutlass.Int32)
+        global_token_cute = utils.scalar_to_ssa(global_token, cutlass.Int32)
+        return ((m_idx >= n_idx) & ((m_idx - n_idx <= (left_window_size_cute)) | (n_idx < global_token_cute))) | ((n_idx >= m_idx) & ((n_idx - m_idx <= (right_window_size_cute)) | (m_idx < global_token_cute)))
 
     return {
         "cute_mask_mod": cute_global_sliding_window_mask,
         "flex_mask_mod": global_sliding_window,
-        "aux_tensors": [
-            torch.tensor(left_window_size, dtype=torch.int32, device=device).unsqueeze(0),
-            torch.tensor(right_window_size, dtype=torch.int32, device=device).unsqueeze(0),
-            torch.tensor(global_token, dtype=torch.int32, device=device).unsqueeze(0),
-        ],
+        "aux_tensors": None,
         "causal": False,
     }
 
