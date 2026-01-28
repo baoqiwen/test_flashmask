@@ -35,100 +35,59 @@ random.seed(0)
 
 torch._dynamo.config.cache_size_limit = 1000
 
-# Note(umiswing): idk how to pass aux tensors if i want to create block sparse for bwd, i find no way
-# def compute_block_sparse_tensors(
-#     flex_mask_mod,
-#     batch_size,
-#     block_mask_nheads,
-#     seqlen_q,
-#     seqlen_k,
-#     device,
-#     sparse_tile_m,
-#     tile_n,
-# ):
-#     if flex_mask_mod is not None:
-#         bm = create_block_mask(
-#             flex_mask_mod,
-#             batch_size,
-#             block_mask_nheads,
-#             seqlen_q,
-#             seqlen_k,
-#             device="cuda",
-#             BLOCK_SIZE=(sparse_tile_m, tile_n),
-#         )
-#         (
-#             _seq_q,
-#             _seq_k,
-#             kv_mask_cnt,
-#             kv_mask_idx,
-#             full_kv_cnt,
-#             full_kv_idx,
-#             q_mask_cnt,
-#             q_mask_idx,
-#             full_q_cnt,
-#             full_q_idx,
-#             *_,
-#         ) = bm.as_tuple()
-#         block_sparse_tensors_fwd = BlockSparseTensorsTorch(
-#             mask_block_cnt=kv_mask_cnt,
-#             mask_block_idx=kv_mask_idx,
-#             full_block_cnt=full_kv_cnt,
-#             full_block_idx=full_kv_idx,
-#             block_size=(sparse_tile_m, tile_n),
-#         )
-# 
-#         sparse_tile_m_bwd =sparse_tile_m
-#         block_sparse_tensors_bwd = BlockSparseTensorsTorch(
-#             mask_block_cnt=q_mask_cnt,
-#             mask_block_idx=q_mask_idx,
-#             full_block_cnt=full_q_cnt,
-#             full_block_idx=full_q_idx,
-#             block_size=(sparse_tile_m_bwd, tile_n),
-#         )
-#     else:
-#         block_sparse_tensors_fwd = None
-#         block_sparse_tensors_bwd = None
-#     return block_sparse_tensors_fwd, block_sparse_tensors_bwd
-
-# Note(umiswing): forward only
 def compute_block_sparse_tensors(
-    cute_mask_mod,
+    flex_mask_mod,
     batch_size,
-    nheads,
+    block_mask_nheads,
     seqlen_q,
     seqlen_k,
-    tile_m,
+    sparse_tile_m,
     tile_n,
-    window_size=None,
-    aux_tensors_cute=None,
-    use_fast_sampling=False,
 ):
-    """Call compute_block_sparsity and return torch tensors."""
-    if cute_mask_mod is not None:
-        _, torch_tensors = compute_block_sparsity(
-            tile_m=tile_m,
-            tile_n=tile_n,
-            batch_size=batch_size,
-            num_heads=nheads,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            mask_mod=cute_mask_mod,
-            aux_tensors=aux_tensors_cute,
+    if flex_mask_mod is not None:
+        bm = create_block_mask(
+            flex_mask_mod,
+            batch_size,
+            block_mask_nheads,
+            seqlen_q,
+            seqlen_k,
             device="cuda",
-            use_fast_sampling=use_fast_sampling,
+            _compile=True,
+            BLOCK_SIZE=(sparse_tile_m, tile_n),
         )
-        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = torch_tensors
+        (
+            _seq_q,
+            _seq_k,
+            kv_mask_cnt,
+            kv_mask_idx,
+            full_kv_cnt,
+            full_kv_idx,
+            q_mask_cnt,
+            q_mask_idx,
+            full_q_cnt,
+            full_q_idx,
+            *_,
+        ) = bm.as_tuple()
+        block_sparse_tensors_fwd = BlockSparseTensorsTorch(
+            mask_block_cnt=kv_mask_cnt,
+            mask_block_idx=kv_mask_idx,
+            full_block_cnt=full_kv_cnt,
+            full_block_idx=full_kv_idx,
+            block_size=(sparse_tile_m, tile_n),
+        )
 
-        block_sparse_tensors = BlockSparseTensorsTorch(
-            mask_block_cnt=mask_block_cnt,
-            mask_block_idx=mask_block_idx,
-            full_block_cnt=full_block_cnt,
-            full_block_idx=full_block_idx,
+        sparse_tile_m_bwd =sparse_tile_m
+        block_sparse_tensors_bwd = BlockSparseTensorsTorch(
+            mask_block_cnt=q_mask_cnt,
+            mask_block_idx=q_mask_idx,
+            full_block_cnt=full_q_cnt,
+            full_block_idx=full_q_idx,
+            block_size=(sparse_tile_m_bwd, tile_n),
         )
     else:
-        block_sparse_tensors = None
-
-    return block_sparse_tensors
+        block_sparse_tensors_fwd = None
+        block_sparse_tensors_bwd = None
+    return block_sparse_tensors_fwd, block_sparse_tensors_bwd
 
 def compute_density_sparsity(flex_mask_mod, causal, B, H, M, N, tile_m, tile_n, device="cuda"):
     if flex_mask_mod is not None:
@@ -270,16 +229,14 @@ def test_mask(
     else:
         data_type = torch.float16
 
-    #assert score_mod is not None or mask_mod is not None, "Must provide a score_mod or mask_mod"
-    block_sparse_tensors_fwd = compute_block_sparse_tensors(
-        cute_mask_mod=cute_mask_mod,
+    block_sparse_tensors_fwd, block_sparse_tensors_bwd = compute_block_sparse_tensors(
+        flex_mask_mod=flex_mask_mod,
         batch_size=B,
-        nheads=H,
+        block_mask_nheads=H, # TODO(umiswing): try pack_gqa
         seqlen_q=S,
         seqlen_k=S,
-        tile_m=sparse_tile_m_fwd,
+        sparse_tile_m=sparse_tile_m_fwd,
         tile_n=tile_n,
-        aux_tensors_cute=aux_tensors_cute,
     )
 
     density, sparsity = compute_density_sparsity(
@@ -320,14 +277,15 @@ def test_mask(
         q=q,
         k=k,
         v=v,
+        m_block_size=tile_m, n_block_size=tile_n,
         out=out_cute,
         dout=gradOut,
         lse=lse_cute,
         causal=causal,
         mask_mod=cute_mask_mod,
         # Note(umiswing): idk how to pass aux tensors in bm of bwd
-        # block_sparse_tensors=block_sparse_tensors_bwd,
-        block_sparse_tensors=None,
+        block_sparse_tensors=block_sparse_tensors_bwd,
+        # block_sparse_tensors=None,
         aux_tensors=aux_tensors,
     )
 
