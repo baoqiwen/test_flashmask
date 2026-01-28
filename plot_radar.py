@@ -122,7 +122,9 @@ def plot_radar(categories, save_path, methods,
         'old_flashmaskv3': 'FlashMask V3 B.O.',
         'flashmaskv3': 'FlashMask V3',
         'flashmaskv1': 'FlashMask V1',
-        'flexattention': 'FlexAttention'
+        'flexattention': 'FlexAttention',
+        'fa4_mask_mod': 'FA4 mask_mod',
+        'flashmaskv4': 'FlashMask V4',
     }
     
     legend_labels = [method_name_mapping.get(label, label) for label in legend_labels]
