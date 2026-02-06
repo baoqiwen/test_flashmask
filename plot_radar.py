@@ -77,47 +77,53 @@ def plot_radar(categories, save_path, methods,
         perc_offset = max_r * 0.18
         angle_offset = np.deg2rad(3)
 
-        if show_value_labels and len(methods) >= 2:
-            baseline_method = methods[0]
-            baseline_values = method_data[baseline_method]
-            
+        for i_method, method in enumerate(methods):
+            values = method_data[method]
+            color = colors[i_method % len(colors)]
             for i in range(num_vars):
                 angle = angles[i]
-                
+                val = values[i]
+                if show_value_labels:
+                    if len(methods) == 1:
+                        ax.text(angle, val + outer_offset, f'{val:.1f}',
+                                color=color, fontsize=9, ha='center', va='center',
+                                fontproperties=font_prop,
+                                bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=color, lw=0.6, alpha=0.85))
+                    else:
+                        if i_method == 0:
+                            # baseline
+                            ax.text(angle - angle_offset, val - base_offset, f'{val:.1f}',
+                                    color=color, fontsize=9, ha='center', va='center',
+                                    fontproperties=font_prop,
+                                    bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=color, lw=0.6, alpha=0.85))
+                        elif show_second_label:
+                            # compare
+                            ax.text(angle + angle_offset, val + outer_offset, f'{val:.1f}',
+                                    color=color, fontsize=9, ha='center', va='center',
+                                    fontproperties=font_prop,
+                                    bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=color, lw=0.6, alpha=0.85))
+
+        # draw percentage (when len methods >= 2)
+        if show_percent_label and len(methods) >= 2:
+            baseline_method = methods[0]
+            baseline_values = method_data[baseline_method]
+            for i in range(num_vars):
+                angle = angles[i]
                 bval = baseline_values[i]
-                ax.text(angle - angle_offset, bval - base_offset, f'{bval:.1f}',
-                        color=colors[0], fontsize=9, ha='center', va='center',
-                        fontproperties=font_prop,
-                        bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=colors[0], lw=0.6, alpha=0.85))
-
-                if show_second_label:
-                    compare_method = methods[1]
+                for method_idx in range(1, len(methods)):
+                    compare_method = methods[method_idx]
                     fval = method_data[compare_method][i]
-                    ax.text(angle + angle_offset, fval + outer_offset, f'{fval:.1f}',
-                            color=colors[1], fontsize=9, ha='center', va='center',
-                            fontproperties=font_prop,
-                            bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=colors[1], lw=0.6, alpha=0.85))
-
-                if show_percent_label and len(methods) >= 2:
-                    bval = baseline_values[i]
-                    
-                    for method_idx in range(1, len(methods)):
-                        compare_method = methods[method_idx]
-                        fval = method_data[compare_method][i]
-                        inc = (fval / bval - 1) * 100 if bval != 0 else np.nan
-                        sign = "+" if not np.isnan(inc) and inc >= 0 else ""
-
-                        if not np.isnan(inc):
-                            method_perc_offset = perc_offset + (method_idx - 1) * (max_r * 0.08)
-                            method_color = colors[method_idx % len(colors)]
-                            
-                            ax.text(angle - angle_offset, fval + method_perc_offset, f'{sign}{inc:.1f}%',
-                                    color=method_color, fontsize=9, ha='center', va='center',
-                                    fontproperties=font_prop, fontweight='bold',
-                                    bbox=dict(boxstyle="round,pad=0.19", fc="#f7f7f7", ec=method_color, lw=0.7, alpha=0.7))
+                    inc = (fval / bval - 1) * 100 if bval != 0 else np.nan
+                    sign = "+" if not np.isnan(inc) and inc >= 0 else ""
+                    if not np.isnan(inc):
+                        method_perc_offset = perc_offset + (method_idx - 1) * (max_r * 0.08)
+                        method_color = colors[method_idx % len(colors)]
+                        ax.text(angle - angle_offset, fval + method_perc_offset, f'{sign}{inc:.1f}%',
+                                color=method_color, fontsize=9, ha='center', va='center',
+                                fontproperties=font_prop, fontweight='bold',
+                                bbox=dict(boxstyle="round,pad=0.19", fc="#f7f7f7", ec=method_color, lw=0.7, alpha=0.7))
 
     handles, legend_labels = axs[0].get_legend_handles_labels()
-
     method_name_mapping = {
         'old_flashmaskv3': 'FlashMask V3 B.O.',
         'flashmaskv3': 'FlashMask V3',
@@ -126,7 +132,6 @@ def plot_radar(categories, save_path, methods,
         'fa4_mask_mod': 'FA4 mask_mod',
         'flashmaskv4': 'FlashMask V4',
     }
-    
     legend_labels = [method_name_mapping.get(label, label) for label in legend_labels]
 
     fig.legend(
@@ -138,6 +143,16 @@ def plot_radar(categories, save_path, methods,
     plt.savefig(save_path, dpi=300)
     plt.savefig(save_path+'.pdf', dpi=300, format='pdf')
     plt.show()
+
+def get_column_name(df, target, strip=True, startswith=False):
+    for col in df.columns:
+        col_cmp = col.strip() if strip else col
+        target_cmp = target.strip() if strip else target
+        if col_cmp == target_cmp:
+            return col
+        if startswith and col_cmp.startswith(target_cmp):
+            return col
+    raise KeyError(f"No column found for '{target}' (strip={strip}, startswith={startswith})")
 
 def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
     plt.rcParams['font.family'] = "Liberation Mono"
@@ -152,25 +167,25 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                     method_to_df = {}
                     for method in methods:
                         filenames = glob.glob(f'{root_dir}/{dtype}/{method}_*{seqlen}_*_{headdim}*.csv')
-                        print(f"Method {method}, files: {filenames}")
                         dataframes = []
-                        non_numeric_column = 'Operation              '
-
-                        if kernel == "fwd":
-                            metric = '  FW TFLOPs/s'
-                        elif kernel == "bwd":
-                            metric = '  BW TFLOPs/s'
-                        elif kernel == "total":
-                            metric = '  TOTAL TFLOPs/s'
-                        else:
-                            raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
-
-                        columns_to_average = [metric, '  Sparsity']
-
                         for file_path in filenames:
                             df = read_tsv_to_dataframe(file_path)
                             if df is not None:
                                 dataframes.append(df)
+
+                        print(f"Method {method}, files: {filenames}")
+                        non_numeric_column = get_column_name(df, 'Operation')
+
+                        if kernel == "fwd":
+                            metric = get_column_name(df, 'FW TFLOPs/s')
+                        elif kernel == "bwd":
+                            metric = get_column_name(df, 'BW TFLOPs/s')
+                        elif kernel == "total":
+                            metric = get_column_name(df, 'TOTAL TFLOPs/s')
+                        else:
+                            raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
+
+                        columns_to_average = [metric, '  Sparsity']
         
                         if not dataframes:
                             print(f"Warning: No data found for method {method}, sequence length {seqlen}")
@@ -192,7 +207,7 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                         
                     one_item = {}
                     first_method = list(method_to_df.keys())[0]
-                    labels = method_to_df[first_method]['Operation              '].tolist()
+                    labels = method_to_df[first_method][non_numeric_column].tolist()
                     labels = [label.strip() for label in labels]
                     one_item['labels'] = labels
                     
@@ -216,7 +231,7 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                 
                 if categories:
                     methods_str = "_vs_".join(methods)
-                    plot_radar(categories, f'{root_dir}/{methods_str}_{dtype}_{headdim}_{kernel}', methods, 
+                    plot_radar(categories, f'{root_dir}/fig/{methods_str}_{dtype}_{headdim}_{kernel}', methods, 
                               show_value_labels=True, show_percent_label=True)
                 else:
                     print(f"Warning: No categories data for {dtype}_{headdim}_{kernel}")
