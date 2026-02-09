@@ -27,6 +27,8 @@ from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
+from datetime import datetime
+
 torch.set_default_device("cuda")
 torch.manual_seed(0)
 
@@ -203,6 +205,7 @@ def test_mask(
     mask_info,
     B,
     H,
+    HKV,
     S,
     D,
     dtype,
@@ -210,6 +213,10 @@ def test_mask(
     print_mask: bool = True,
     device: str = "cuda",
 ):
+    # Note(umiswing): see https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/interface.py#L708-L711
+    # btw, we actually should not set block_mask_nheads to 1, it should always be qhead, otherwise the mask info is wrong
+    # original fa cute test so stupid...
+    pack_gqa = False
     cute_mask_mod = mask_info["cute_mask_mod"]
     flex_mask_mod = mask_info["flex_mask_mod"]
     aux_tensors = mask_info["aux_tensors"]
@@ -232,7 +239,7 @@ def test_mask(
     block_sparse_tensors_fwd, block_sparse_tensors_bwd = compute_block_sparse_tensors(
         flex_mask_mod=flex_mask_mod,
         batch_size=B,
-        block_mask_nheads=H, # TODO(umiswing): try pack_gqa
+        block_mask_nheads=1 if pack_gqa else H, # TODO(umiswing): try pack_gqa
         seqlen_q=S,
         seqlen_k=S,
         sparse_tile_m=sparse_tile_m_fwd,
@@ -246,13 +253,17 @@ def test_mask(
         H=H,
         M=S,
         N=S,
-        tile_m=sparse_tile_m_fwd,
+        tile_m=tile_m,
         tile_n=tile_n
     )
 
-    q, k, v, out, gradOut = [
+    q, out, gradOut = [
         torch.randn(B, S, H, D, device=device, dtype=data_type, requires_grad=True)
-        for _ in range(5)
+        for _ in range(3)
+    ]
+    k, v = [
+        torch.randn(B, S, HKV, D, device=device, dtype=data_type, requires_grad=True)
+        for _ in range(2)
     ]
     lse = torch.empty(B, H, S, device=device, dtype=torch.float32)
 
@@ -263,6 +274,7 @@ def test_mask(
         mask_mod=cute_mask_mod, block_sparse_tensors=block_sparse_tensors_fwd,
         aux_tensors=aux_tensors,
         return_lse=True,
+        pack_gqa=pack_gqa,
     )
 
     results = []
@@ -287,6 +299,7 @@ def test_mask(
         block_sparse_tensors=block_sparse_tensors_bwd,
         # block_sparse_tensors=None,
         aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
     )
 
     bwd_time_ms = do_bench(fa4_mask_mod_bwd_call)
@@ -678,7 +691,8 @@ def generate_qk_sparse_mask(B=16, S=8192, maskout_pair=[(1024, 538), (2358, 1700
     }
 
 
-def generate_random_eviction_mask(B=16, H=16, S=8192, start_row=4096, device="cuda"):
+def generate_random_eviction_mask(B=16, H=16, HKV=16, S=8192, start_row=4096, device="cuda"):
+    assert H == HKV
     start_rows_list = []
     for bz_idx in range(B):
         for head_idx in range(H):
@@ -715,6 +729,70 @@ def generate_random_eviction_mask(B=16, H=16, S=8192, start_row=4096, device="cu
         "causal": True,
     }
 
+def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_seq_lens, window_size=512, ratio=3, device="cuda"):
+    assert hkv % (ratio + 1) == 0
+    hswa = hkv // (ratio + 1) * ratio
+
+    # Note(umiswing): i have no idea how to reuse this code snippet
+    assert len(doc_seq_lens) >= 2
+    total_seq_len = 0
+    for prefix_length, seq_length in doc_seq_lens:
+        total_seq_len += seq_length
+    assert total_seq_len <= seqlen
+    padding = seqlen - total_seq_len
+
+    prefix_lts = []
+    cur_len_so_far = doc_seq_lens[0][1]
+    for i in range(len(doc_seq_lens)):
+        prefix_lts.extend([cur_len_so_far] * doc_seq_lens[i][1])
+        if i < len(doc_seq_lens) - 1:
+            cur_len_so_far += doc_seq_lens[i+1][1]
+    if padding > 0:
+        prefix_lts.extend([cur_len_so_far] * padding)
+
+    ute = []
+    cur_len_so_far = 0
+    for prefix_length, seq_length in doc_seq_lens:
+        ute.extend([cur_len_so_far] * prefix_length + list(range(cur_len_so_far+prefix_length, cur_len_so_far+seq_length)))
+        cur_len_so_far += seq_length
+    if padding > 0:
+        ute.extend([total_seq_len] * padding)
+
+    prefix_lts = torch.tensor(prefix_lts,  device=device, dtype=torch.int32).reshape((1, 1, -1)).repeat_interleave(batch_size, 0).repeat_interleave(hkv, 1)
+    ute= torch.tensor(ute,  device=device, dtype=torch.int32).reshape((1, 1, -1)).repeat_interleave(batch_size, 0).repeat_interleave(hkv, 1)
+
+    swa_lts = torch.arange(
+        start=window_size, end=seqlen + window_size, dtype=torch.int32,
+    ).reshape([1, 1, seqlen])
+    swa_lts = torch.clip(
+        swa_lts, max=seqlen,
+    ).repeat_interleave(batch_size, 0).repeat_interleave(hswa, 1)
+
+    lts = torch.concat((torch.minimum(swa_lts, prefix_lts[:, :hswa, :]), prefix_lts[:, hswa:, :]), dim=1)
+
+    def hybrid_swa_prefix_lm_document_mask(b, h, q_idx, kv_idx):
+        return (q_idx < lts[b, h, kv_idx]) & (q_idx >= ute[b, h, kv_idx])
+
+    @cute.jit
+    def cute_hybrid_swa_prefix_lm_document_mask(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        m_idx: cute.TensorSSA,
+        n_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors,
+    ) -> cute.TensorSSA:
+        down_left_row_indices = aux_tensors[0]
+        up_right_row_indices = aux_tensors[1]
+        return (m_idx < down_left_row_indices[batch[0], head[0], n_idx[0]]) & (m_idx >= up_right_row_indices[batch[0], head[0], n_idx[0]])
+
+    return {
+        "cute_mask_mod": cute_hybrid_swa_prefix_lm_document_mask,
+        "flex_mask_mod": hybrid_swa_prefix_lm_document_mask,
+        "aux_tensors": [lts, ute],
+        "causal": False,
+    }
+
 def split_sequence(sequence_length):
     if sequence_length < 3:
         raise ValueError("序列长度必须至少为 3，以保证能够分配给一个 Question 和两个 Answer。")
@@ -742,6 +820,7 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
     """
+    current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     total_length = 0
     doc_seq_lens_list = []
     with open('kernel_test_seq_info.txt', 'r') as f:
@@ -759,8 +838,9 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         # Note(umiswing): fa4 does not support d 256
         # for D in [64, 128, 256]:
-        for D in [64, 128]:
+        for D in [128]:
             H = 4096 // D
+            HKV = H
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
 
@@ -779,18 +859,19 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
 
                 available_examples = {
-                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(mask_info=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(mask_info=generate_prefix_lm_causal_mask(prefix_length=int(S*0.5), B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(mask_info=generate_qk_sparse_mask(maskout_pair=maskout_pair, B=B, S=S), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(mask_info=generate_random_eviction_mask(start_row=S//2, B=B, S=S, H=H), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Full": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": False}, B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Document Mask": lambda: test_mask(mask_info=generate_prefix_lm_document_mask(doc_seq_lens=prefix_doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Causal Mask": lambda: test_mask(mask_info=generate_prefix_lm_causal_mask(prefix_length=int(S*0.5), B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "QK-sparse Mask": lambda: test_mask(mask_info=generate_qk_sparse_mask(maskout_pair=maskout_pair, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Random Eviction Mask": lambda: test_mask(mask_info=generate_random_eviction_mask(start_row=S//2, B=B, S=S, H=H, HKV=HKV), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(mask_info=generate_hybrid_swa_prefix_lm_document_mask(batch_size=B, seqlen=S, hkv=H, d=D, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                 }
 
                 if "all" in examples:
@@ -830,7 +911,7 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}", exist_ok=True)
-                text_file = open(f"{dtype}/fa4_mask_mod_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}/fa4_mask_mod_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 
