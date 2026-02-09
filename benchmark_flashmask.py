@@ -11,6 +11,7 @@ except (ImportError, ModuleNotFoundError):
     from paddle.nn.functional.flash_attention import flashmask_attention
 import random
 import os
+from datetime import datetime
 
 np.random.seed(0)
 random.seed(0)
@@ -109,17 +110,13 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
 
 def test_mask(
     generate_mask_fn,
-    B: int = 16,
-    S: int = 8192,
-    H: int = 16,
-    D: int = 64,
+    B,
+    S,
+    H,
+    HKV,
+    D,
     dtype = 'bf16',
 ):
-
-    #B = 1
-    #S = 8192
-    #H = 4
-    #D = 128
 
     if dtype == 'bf16':
         data_type = paddle.bfloat16
@@ -127,8 +124,8 @@ def test_mask(
         data_type = paddle.float16
 
     query = paddle.randn([B, S, H, D], dtype=data_type)
-    key = paddle.randn([B, S, H, D], dtype=data_type)
-    value = paddle.randn([B, S, H, D], dtype=data_type)
+    key = paddle.randn([B, S, HKV, D], dtype=data_type)
+    value = paddle.randn([B, S, HKV, D], dtype=data_type)
     gradOut = paddle.randn([B, S, H, D], dtype=data_type)
 
     query.stop_gradient = False
@@ -137,9 +134,9 @@ def test_mask(
 
     startend_row_indices, causal = None, True
     if generate_mask_fn is not None:
-        startend_row_indices, causal = generate_mask_fn(B, S, H, D)
+        startend_row_indices, causal = generate_mask_fn(B, S, HKV, D)
 
-    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, S)
+    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S)
     density = 1.0 - sparsity 
 
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal, return_softmax_lse=True)
@@ -210,6 +207,7 @@ def flashmask_block_sparsity(
     flashmask,
     B=None,
     H=None,
+    HKV=None,
     S=None,
     KV_BLOCK_SIZE=128,
     Q_BLOCK_SIZE=128,
@@ -252,13 +250,13 @@ def flashmask_block_sparsity(
     Bc = KV_BLOCK_SIZE
     
     if LTS is not None:
-        B, H, S = LTS.shape
+        B, H_mask, S = LTS.shape
     if LTE is not None:
-        B, H, S = LTE.shape
+        B, H_mask, S = LTE.shape
     if UTS is not None:
-        B, H, S = UTS.shape
+        B, H_mask, S = UTS.shape
     if UTE is not None:
-        B, H, S = UTE.shape
+        B, H_mask, S = UTE.shape
     
     Tr = S // Br
     Tc = S // Bc
@@ -266,35 +264,36 @@ def flashmask_block_sparsity(
     if LTS is not None:
         LTS = LTS.cpu().detach().numpy()
     else:
-        LTS = np.full((B, H, S), S, dtype=np.int32)
-    LTStartMax = np.array(LTS).reshape([B, H, -1, Bc]).max(axis=-1)
-    LTStartMin = np.array(LTS).reshape([B, H, -1, Bc]).min(axis=-1)
+        LTS = np.full((B, H_mask, S), S, dtype=np.int32)
+    LTStartMax = np.array(LTS).reshape([B, H_mask, -1, Bc]).max(axis=-1)
+    LTStartMin = np.array(LTS).reshape([B, H_mask, -1, Bc]).min(axis=-1)
 
     if LTE is not None:
         LTE = LTE.cpu().detach().numpy()
     else:
-        LTE = np.full((B, H, S), S, dtype=np.int32)
-    LTEndMax = np.array(LTE).reshape([B, H, -1, Bc]).max(-1)
-    LTEndMin = np.array(LTE).reshape([B, H, -1, Bc]).min(-1)
+        LTE = np.full((B, H_mask, S), S, dtype=np.int32)
+    LTEndMax = np.array(LTE).reshape([B, H_mask, -1, Bc]).max(-1)
+    LTEndMin = np.array(LTE).reshape([B, H_mask, -1, Bc]).min(-1)
     
     if UTS is not None:
         UTS = UTS.cpu().detach().numpy()
     else:
-        UTS = np.full((B, H, S,), 0, dtype=np.int32)
-    UTStartMax = np.array(UTS).reshape([B, H, -1, Bc]).max(-1)
-    UTStartMin = np.array(UTS).reshape([B, H, -1, Bc]).min(-1)
+        UTS = np.full((B, H_mask, S,), 0, dtype=np.int32)
+    UTStartMax = np.array(UTS).reshape([B, H_mask, -1, Bc]).max(-1)
+    UTStartMin = np.array(UTS).reshape([B, H_mask, -1, Bc]).min(-1)
 
     if UTE is not None:
         UTE = UTE.cpu().detach().numpy()
     else:
-        UTE = np.tile(np.arange(S, dtype=np.int32).reshape(1, 1, S), (B, H, 1))
-    UTEndMax = np.array(UTE).reshape([B, H, -1, Bc]).max(-1)
-    UTEndMin = np.array(UTE).reshape([B, H, -1, Bc]).min(-1)
+        UTE = np.tile(np.arange(S, dtype=np.int32).reshape(1, 1, S), (B, H_mask, 1))
+    UTEndMax = np.array(UTE).reshape([B, H_mask, -1, Bc]).max(-1)
+    UTEndMin = np.array(UTE).reshape([B, H_mask, -1, Bc]).min(-1)
 
     
     num_dense_blocks = 0
     for bsz in range(B):
-        for head in range(H):
+        for q_head in range(H):
+            head = q_head // (H // H_mask)
             for i in range(Tr):
                 for j in range(Tc):
                     if causal and j > i:
@@ -562,6 +561,54 @@ def generate_random_eviction_mask(B, S, H, D, start_row=4096):
     causal = True
     return startend_row_indices, causal
 
+def generate_hybrid_swa_causal_mask(batch_size, seqlen, hkv, d, window_size=512, ratio=3):
+    assert hkv % (ratio + 1) == 0
+    hswa = hkv // (ratio + 1) * ratio
+    hcausal = hkv // (ratio + 1)
+
+    swa_startend_row_indices = paddle.arange(
+        window_size, seqlen + window_size, dtype="int32"
+    ).reshape((1, 1, seqlen, 1))
+
+    swa_startend_row_indices = paddle.clip(
+        swa_startend_row_indices, max=seqlen,
+    ).repeat_interleave(batch_size, 0).repeat_interleave(hswa, 1)
+
+    causal_startend_row_indices = paddle.arange(0, seqlen, dtype="int32"
+    ).reshape((1, 1, seqlen, 1)).repeat_interleave(batch_size, 0).repeat_interleave(hcausal, 1)
+
+    startend_row_indices = paddle.concat(x=[swa_startend_row_indices, causal_startend_row_indices], axis=1)
+    return startend_row_indices, True
+
+def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_seq_lens, window_size=512, ratio=3):
+    assert hkv % (ratio + 1) == 0
+    hswa = hkv // (ratio + 1) * ratio
+    hprefix = hkv // (ratio + 1)
+
+    # Note(umiswing): its so silly that this gen func dont do anything for num head
+    prefix_lm_document_mask, _ = generate_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_seq_lens)
+    prefix_lm_document_mask = paddle.repeat_interleave(prefix_lm_document_mask, hkv, 1)
+
+    swa_prefix_lm_document_mask = prefix_lm_document_mask[:,:hswa,:,:]
+    pure_prefix_lm_document_mask = prefix_lm_document_mask[:,hswa:,:,:]
+
+    lts = swa_prefix_lm_document_mask[..., 0].unsqueeze(axis=-1)
+    ute = swa_prefix_lm_document_mask[..., 1].unsqueeze(axis=-1)
+
+    swa_startend_row_indices = paddle.arange(
+        window_size, seqlen + window_size, dtype="int32"
+    ).reshape((1, 1, seqlen, 1))
+
+    swa_startend_row_indices = paddle.clip(
+        swa_startend_row_indices, max=seqlen,
+    ).repeat_interleave(batch_size, 0).repeat_interleave(hswa, 1)
+
+    hybrid_lts = paddle.minimum(swa_startend_row_indices, lts)
+    swa_prefix_lm_document_mask = paddle.concat(x=[hybrid_lts, ute], axis=3)
+
+    hybrid_mask = paddle.concat(x=[swa_prefix_lm_document_mask, pure_prefix_lm_document_mask], axis=1)
+    return hybrid_mask, False
+
 def split_sequence(sequence_length):
     if sequence_length < 3:
         raise ValueError("序列长度必须至少为 3，以保证能够分配给一个 Question 和两个 Answer。")
@@ -589,6 +636,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
     Args:
         examples: List of examples to run. If "all" is specified, all examples will be run.
     """
+    current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     if fm_version == 1:
         paddle.set_flags({'FLAGS_flash_attn_version': 2})
     elif fm_version == 3:
@@ -614,13 +662,20 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         for D in [64, 128] if fm_version == 4 else [64, 128, 256]:
             H = 4096 // D
+            HKV = H
+            # H = 32
+            # HKV = 4
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
+                # if S == 8192:
+                #     B = 2
+                # else:
+                #     B = 1
 
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []
                 offset = 0
-                print(f"{B}_{S}_{H}_{D}_{idx}_{dtype}")
+                print(f"{B}_{S}_{H}_{HKV}_{D}_{idx}_{dtype}")
                 if not overwrite:
                     if os.path.exists(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv"):
                         print(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv already exists, skipping. To enable overwrite, use: --overwrite (True by default).")
@@ -634,20 +689,20 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                         offset += doc_seq
 
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
-
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, D=D, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, D=D, dtype=dtype),
+                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                 }
 
                 if "all" in examples:
@@ -687,7 +742,7 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}{suffix}", exist_ok=True)
-                text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{B}_{S}_{H}_{D}_{idx}.csv","w")
+                text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()
 
