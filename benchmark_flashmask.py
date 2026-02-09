@@ -112,6 +112,7 @@ def test_mask(
     generate_mask_fn,
     B,
     S,
+    SKV,
     H,
     HKV,
     D,
@@ -124,8 +125,8 @@ def test_mask(
         data_type = paddle.float16
 
     query = paddle.randn([B, S, H, D], dtype=data_type)
-    key = paddle.randn([B, S, HKV, D], dtype=data_type)
-    value = paddle.randn([B, S, HKV, D], dtype=data_type)
+    key = paddle.randn([B, SKV, HKV, D], dtype=data_type)
+    value = paddle.randn([B, SKV, HKV, D], dtype=data_type)
     gradOut = paddle.randn([B, S, H, D], dtype=data_type)
 
     query.stop_gradient = False
@@ -134,9 +135,9 @@ def test_mask(
 
     startend_row_indices, causal = None, True
     if generate_mask_fn is not None:
-        startend_row_indices, causal = generate_mask_fn(B, S, HKV, D)
+        startend_row_indices, causal = generate_mask_fn(B, SKV, HKV, D)
 
-    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S)
+    sparsity = flashmask_block_sparsity(causal, startend_row_indices, B, H, HKV, S, SKV)
     density = 1.0 - sparsity 
 
     flashmask = lambda: flashmask_attention(query, key, value, startend_row_indices=startend_row_indices, causal=causal, return_softmax_lse=True)
@@ -192,9 +193,9 @@ def test_mask(
 
     total_time_ms = fwd_time_ms + bwd_time_ms
 
-    fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd')
-    bwd_flops = density * cal_flops(B, H, S, S, D, mode='bwd')
-    total_flops = density * cal_flops(B, H, S, S, D, mode='fwd_bwd')
+    fwd_flops = density * cal_flops(B, H, S, SKV, D, mode='fwd')
+    bwd_flops = density * cal_flops(B, H, S, SKV, D, mode='bwd')
+    total_flops = density * cal_flops(B, H, S, SKV, D, mode='fwd_bwd')
 
     fwd_tflops = cal_tflops(fwd_flops, fwd_time_ms)
     bwd_tflops = cal_tflops(bwd_flops, bwd_time_ms)
@@ -209,6 +210,7 @@ def flashmask_block_sparsity(
     H=None,
     HKV=None,
     S=None,
+    SKV=None,
     KV_BLOCK_SIZE=128,
     Q_BLOCK_SIZE=128,
     ):
@@ -216,11 +218,12 @@ def flashmask_block_sparsity(
     if flashmask is None and not causal:
         return 0.0
     elif flashmask is None and causal:
+        assert S == SKV
         Br = Q_BLOCK_SIZE
         Bc = KV_BLOCK_SIZE
         Tr = S // Br
-        Tc = S // Bc
-        total_size = B * H * S * S
+        Tc = SKV // Bc
+        total_size = B * H * S * SKV
         num_sparse_blocks = Tr * (Tc - 1) // 2 * B * H
         sparsity = ((num_sparse_blocks * Bc * Br) / total_size)
         return sparsity
@@ -259,32 +262,33 @@ def flashmask_block_sparsity(
         B, H_mask, S = UTE.shape
     
     Tr = S // Br
-    Tc = S // Bc
+    Tc = SKV // Bc
 
     if LTS is not None:
         LTS = LTS.cpu().detach().numpy()
     else:
-        LTS = np.full((B, H_mask, S), S, dtype=np.int32)
+        LTS = np.full((B, H_mask, SKV), S, dtype=np.int32)
     LTStartMax = np.array(LTS).reshape([B, H_mask, -1, Bc]).max(axis=-1)
     LTStartMin = np.array(LTS).reshape([B, H_mask, -1, Bc]).min(axis=-1)
 
     if LTE is not None:
         LTE = LTE.cpu().detach().numpy()
     else:
-        LTE = np.full((B, H_mask, S), S, dtype=np.int32)
+        LTE = np.full((B, H_mask, SKV), S, dtype=np.int32)
     LTEndMax = np.array(LTE).reshape([B, H_mask, -1, Bc]).max(-1)
     LTEndMin = np.array(LTE).reshape([B, H_mask, -1, Bc]).min(-1)
     
     if UTS is not None:
         UTS = UTS.cpu().detach().numpy()
     else:
-        UTS = np.full((B, H_mask, S,), 0, dtype=np.int32)
+        UTS = np.full((B, H_mask, SKV,), 0, dtype=np.int32)
     UTStartMax = np.array(UTS).reshape([B, H_mask, -1, Bc]).max(-1)
     UTStartMin = np.array(UTS).reshape([B, H_mask, -1, Bc]).min(-1)
 
     if UTE is not None:
         UTE = UTE.cpu().detach().numpy()
     else:
+        assert S == SKV
         UTE = np.tile(np.arange(S, dtype=np.int32).reshape(1, 1, S), (B, H_mask, 1))
     UTEndMax = np.array(UTE).reshape([B, H_mask, -1, Bc]).max(-1)
     UTEndMin = np.array(UTE).reshape([B, H_mask, -1, Bc]).min(-1)
@@ -320,7 +324,7 @@ def flashmask_block_sparsity(
                 #print()
 
     num_sparse_blocks = B * H * Tc * Tr - num_dense_blocks
-    total_size = B * H * S * S
+    total_size = B * H * S * SKV
     sparsity = ((num_sparse_blocks * Bc * Br) / total_size)
     return sparsity
 
@@ -609,6 +613,89 @@ def generate_hybrid_swa_prefix_lm_document_mask(batch_size, seqlen, hkv, d, doc_
     hybrid_mask = paddle.concat(x=[swa_prefix_lm_document_mask, pure_prefix_lm_document_mask], axis=1)
     return hybrid_mask, False
 
+def hybrid_swa(batch_size, seqlen, hkv, causal, startend_row_indices, window_size, swa_ratio):
+    assert not causal
+    assert startend_row_indices.shape[-1] == 2
+    assert startend_row_indices.shape[1] <= hkv
+
+    if startend_row_indices.shape[1] != hkv:
+        startend_row_indices = paddle.repeat_interleave(startend_row_indices, hkv, 1)
+
+    h_hybrid = int(hkv * swa_ratio)
+
+    hybrid_part = startend_row_indices[:, :h_hybrid, :, :]
+    non_hybrid_part = startend_row_indices[:, h_hybrid:, :, :]
+
+    hybrid_lts = hybrid_part[..., 0].unsqueeze(axis=-1)
+    hybrid_ute = hybrid_part[..., 1].unsqueeze(axis=-1)
+
+    swa_startend_row_indices = paddle.arange(
+        window_size, seqlen + window_size, dtype="int32"
+    ).reshape((1, 1, seqlen, 1))
+
+    swa_startend_row_indices = paddle.clip(
+        swa_startend_row_indices, max=seqlen,
+    ).repeat_interleave(batch_size, 0).repeat_interleave(h_hybrid, 1)
+
+    hybrid_lts = paddle.minimum(swa_startend_row_indices, hybrid_lts)
+    hybrid_part = paddle.concat(x=[hybrid_lts, hybrid_ute], axis=3)
+
+    startend_row_indices = paddle.concat(x=[hybrid_part, non_hybrid_part], axis=1)
+    return startend_row_indices
+
+def preprocess_index_dual_chunks(startend_row_indices, chunk_id_first, chunk_id_second, seq_blocksize, max_seqlen_q):
+    """ 
+    Preprocess row indices for dual chunks (DualChunkSwap strategy).
+
+    This function handles the index preprocessing for the balanced dual-chunk
+    strategy where each rank processes chunks from both ends of the sequence.
+
+    Args:
+        startend_row_indices (paddle.Tensor): Original row indices
+        chunk_id_first (int): ID of the first chunk
+        chunk_id_second (int): ID of the second chunk
+        seq_blocksize (int): Size of each sequence block
+        max_seqlen_q (int): Maximum sequence length for queries
+
+    Returns:
+        paddle.Tensor: Preprocessed row indices for dual chunks
+    """
+    # Calculate starting positions for both chunks
+    rows_min_first = chunk_id_first * seq_blocksize
+    rows_min_second = chunk_id_second * seq_blocksize
+
+    # Process first chunk indices
+    indices_first = startend_row_indices - rows_min_first
+    indices_first = paddle.clip(indices_first, min=0, max=max_seqlen_q)
+
+    # Process second chunk indices
+    indices_second = startend_row_indices - rows_min_second
+    indices_second = paddle.clip(indices_second, min=0, max=max_seqlen_q)
+
+    # Offset second chunk indices to avoid overlap
+    indices_second = paddle.where(indices_second != 0, indices_second + max_seqlen_q, indices_second)
+
+    # Combine indices from both chunks
+    combined_indices = paddle.maximum(indices_first, indices_second)
+    return combined_indices
+
+def load_mask(batch_size, seqlen, hkv, head_dim, path, causal, hybrid_mask_fn=None, cp_size=1, cp_rank=0):
+    startend_row_indices = paddle.load(path)
+    if hybrid_mask_fn is not None:
+        startend_row_indices = hybrid_mask_fn(batch_size, seqlen, hkv, causal, startend_row_indices)
+
+    if cp_size > 1:
+        startend_row_indices = preprocess_index_dual_chunks(
+            startend_row_indices,
+            chunk_id_first=cp_rank,
+            chunk_id_second=2 * cp_size - cp_rank - 1,
+            seq_blocksize=seqlen // 2,
+            max_seqlen_q=seqlen // 2,
+        )
+
+    mask_np = startend_row_indices.numpy()
+    return startend_row_indices, causal
+
 def split_sequence(sequence_length):
     if sequence_length < 3:
         raise ValueError("序列长度必须至少为 3，以保证能够分配给一个 Question 和两个 Answer。")
@@ -660,18 +747,14 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
-        for D in [64, 128] if fm_version == 4 else [64, 128, 256]:
+        for D in [128] if fm_version == 4 else [64, 128, 256]:
             H = 4096 // D
             HKV = H
-            # H = 32
-            # HKV = 4
             for idx, (S, prefix_doc_seq_lens, qksparse_mask) in enumerate(doc_seq_lens_list):
                 B = 128 * 1024 // S
-                # if S == 8192:
-                #     B = 2
-                # else:
-                #     B = 1
 
+                SQ = S
+                SKV = S
                 doc_seq_lens = [x[1] for x in prefix_doc_seq_lens]
                 maskout_pair = []
                 offset = 0
@@ -690,19 +773,23 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
 
                 share_qa_docs = [split_sequence(doc_seq) for doc_seq in doc_seq_lens]
                 available_examples = {
-                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Full": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=False), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal": lambda: test_mask(generate_mask_fn=partial(generate_none_mask, causal=True), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_sliding_window_mask, window_size=int(S*0.0625)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+
+                    # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
+                    # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # "Hybrid SWA": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank, hybrid_mask_fn=partial(hybrid_swa, window_size=512, swa_ratio=0.75)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                 }
 
                 if "all" in examples:
