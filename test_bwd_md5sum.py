@@ -1,8 +1,8 @@
 # run this to check aadiff:
-# python -m pytest -v test_fwd_md5sum.py
+# python -m pytest -v test_bwd_md5sum.py
 #
-# run this to record the fwd md5sum (only necessary when you want to update ground truth):
-# python test_fwd_md5sum.py
+# run this to record the bwd md5sum (only necessary when you want to update ground truth):
+# python test_bwd_md5sum.py
 import os
 import json
 import itertools
@@ -49,45 +49,52 @@ GEN_FUNCTIONS_DICT = {
 fa_versions = [4]
 d_dv_combinations = [(64, 64), (80, 80), (128, 128)]
 
-def record_gt(output_file="flashmask_gt.json"):
+def record_gt(output_file="flashmask_bwd_gt.json"):
     gt_records = {}
-    
+
     param_combinations = generate_all_param_combinations()
-    
+
     print(f"Start recording test cases, {len(param_combinations)} test cases in total.")
-    
+
     for i, params in enumerate(param_combinations):
         try:
-            out = run_flashmask_forward(**params)
-            md5sum = out._md5sum()
+            dq_md5, dk_md5, dv_md5 = run_flashmask_backward(**params)
             param_key = generate_param_key(params)
-            
-            gt_records[param_key] = md5sum
+
+            gt_records[param_key] = {
+                "dq": dq_md5,
+                "dk": dk_md5,
+                "dv": dv_md5,
+            }
             if (i + 1) % 10 == 0:
                 print(f"{i+1}/{len(param_combinations)} test cases recorded")
-                
+
         except pytest.skip.Exception as e:
             print(f"Skipping test case due to exception: {params}: {e}")
             continue
-    gt_records["gt_commit_id"] = input("Please input the commit ID of fwd GT md5sum: ")
-    gt_records["gt_commit_msg"] = input("Please input the commit msg of fwd GT md5sum: ")
+    gt_records["gt_commit_id"] = input("Please input the commit ID of bwd GT md5sum: ")
+    gt_records["gt_commit_msg"] = input("Please input the commit msg of bwd GT md5sum: ")
     with open(output_file, 'w') as f:
         json.dump(gt_records, f, indent=2)
-    
+
     print(f"Ground truth saved to '{output_file}', {len(gt_records)} test cases recorded.")
     return gt_records
 
 
-def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
-                         nheads_startend_row_indices, fa_version, dtype, mask_type,
-                         gen_startend_row_indices, softcap=0.0):
+def run_flashmask_backward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv,
+                           nheads_startend_row_indices, fa_version, dtype, mask_type,
+                           gen_startend_row_indices, softcap=0.0):
     paddle.seed(2024)
     np.random.seed(2024)
     assert nheads % nheads_kv == 0
-    
+
     q = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
     v = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
+
+    q.stop_gradient = False
+    k.stop_gradient = False
+    v.stop_gradient = False
 
     startend_row_indices, causal = gen_startend_row_indices(
         batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices
@@ -105,14 +112,22 @@ def run_flashmask_forward(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, 
     else:
         raise ValueError(f"Invalid flash attention version: {fa_version}")
 
+    paddle.set_flags({'FLAGS_cudnn_deterministic': 1})
     out, lse = flashmask_attention(
         q, k, v,
         startend_row_indices=startend_row_indices,
         causal=causal,
         return_softmax_lse=True
     )
-    
-    return out
+
+    g = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
+    out.backward(g)
+
+    dq_md5 = q.grad._md5sum()
+    dk_md5 = k.grad._md5sum()
+    dv_md5 = v.grad._md5sum()
+
+    return dq_md5, dk_md5, dv_md5
 
 
 # 形状组合
@@ -135,9 +150,9 @@ def generate_shapes():
 
 def generate_all_param_combinations():
     combinations = []
-    
+
     dtypes = [paddle.bfloat16]
-    
+
     for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices in generate_shapes():
         for dtype in dtypes:
             for fa_version in fa_versions:
@@ -159,19 +174,19 @@ def generate_all_param_combinations():
                             'softcap': 0.0
                         }
                         combinations.append(params)
-    
+
     return combinations
 
 
 def generate_param_key(params):
     nheads_startend = params['nheads_startend_row_indices']
     dtype_index = get_dtype_index(params['dtype'])
-    
+
     if isinstance(nheads_startend, (list, tuple)):
         nheads_startend_str = '_'.join(map(str, nheads_startend))
     else:
         nheads_startend_str = str(nheads_startend)
-    
+
     return (f"{params['mask_type']}-"
             f"{params['batch_size']}-{params['seqlen_q']}-{params['seqlen_k']}-"
             f"{params['nheads']}-{params['nheads_kv']}-{nheads_startend_str}-"
@@ -187,7 +202,7 @@ def get_dtype_index(dtype):
 
 gt_records = {}
 try:
-    with open("flashmask_gt.json", 'r') as f:
+    with open("flashmask_bwd_gt.json", 'r') as f:
         gt_records = json.load(f)
 except FileNotFoundError:
     pass
@@ -204,8 +219,8 @@ except FileNotFoundError:
     "mask_type, gen_startend_row_indices",
     list(GEN_FUNCTIONS_DICT.items()),
 )
-def test_flashmask_md5(
-    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, 
+def test_flashmask_bwd_md5(
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv,
     nheads_startend_row_indices, fa_version, dtype, mask_type, gen_startend_row_indices, softcap=0.0
 ):
     params = {
@@ -223,22 +238,23 @@ def test_flashmask_md5(
         'gen_startend_row_indices': gen_startend_row_indices,
         'softcap': softcap
     }
-    
+
     param_key = generate_param_key(params)
-    
+
     if param_key not in gt_records:
         pytest.skip(f"No ground truth record for {param_key}")
-    
-    out = run_flashmask_forward(**params)
-    
-    actual_md5 = out._md5sum()
-    expected_md5 = gt_records[param_key]
-    
-    assert actual_md5 == expected_md5, f"MD5 mismatch for {param_key}\nExpected: {expected_md5}\nGot: {actual_md5}"
+
+    dq_md5, dk_md5, dv_md5 = run_flashmask_backward(**params)
+
+    expected = gt_records[param_key]
+
+    assert dq_md5 == expected["dq"], f"dq MD5 mismatch for {param_key}\nExpected: {expected['dq']}\nGot: {dq_md5}"
+    assert dk_md5 == expected["dk"], f"dk MD5 mismatch for {param_key}\nExpected: {expected['dk']}\nGot: {dk_md5}"
+    assert dv_md5 == expected["dv"], f"dv MD5 mismatch for {param_key}\nExpected: {expected['dv']}\nGot: {dv_md5}"
 
 
 if __name__ == "__main__":
-    if not os.path.exists("flashmask_gt.json"):
+    if not os.path.exists("flashmask_bwd_gt.json"):
         print("Start recording ground truth...")
         record_gt()
     else:
