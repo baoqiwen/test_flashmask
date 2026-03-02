@@ -280,7 +280,9 @@ def test_mask(
     results = []
 
     # Forward pass
+    # torch.cuda.nvtx.range_push("fa4")
     fwd_time_ms = do_bench(fa4_mask_mod_call)
+    # torch.cuda.nvtx.range_pop()
     torch._functorch.config.donated_buffer=False
     # Backward pass
     out_cute, lse_cute = fa4_mask_mod_call()
@@ -302,7 +304,10 @@ def test_mask(
         pack_gqa=pack_gqa,
     )
 
+    # torch.cuda.nvtx.range_push("fa4")
     bwd_time_ms = do_bench(fa4_mask_mod_bwd_call)
+    # torch.cuda.nvtx.range_pop()
+
     total_time_ms = fwd_time_ms + bwd_time_ms
 
     fwd_flops = density * cal_flops(B, H, S, S, D, mode='fwd')
@@ -837,7 +842,6 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
             
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         # Note(umiswing): fa4 does not support d 256
-        # for D in [64, 128, 256]:
         for D in [128]:
             H = 4096 // D
             HKV = H
@@ -863,7 +867,8 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
                     "Causal": lambda: test_mask(mask_info={"cute_mask_mod": None, "flex_mask_mod": None, "aux_tensors": None, "causal": True}, B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Sliding Window": lambda: test_mask(mask_info=generate_sliding_window(window_size=int(S*0.0625)), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Causal Document Mask": lambda: test_mask(mask_info=generate_causal_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # Note(umiswing): FA4 mask_mod will hang in Document Mask, and idk why
+                    # "Document Mask": lambda: test_mask(mask_info=generate_document_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Share Question Mask": lambda: test_mask(mask_info=generate_share_question_mask(doc_seq_lens=share_qa_docs, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Global Sliding Window": lambda: test_mask(mask_info=generate_global_sliding_window_mask(global_token=16, B=B, S=S, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Causal Blockwise Mask": lambda: test_mask(mask_info=generate_causal_blockwise_mask(doc_seq_lens=doc_seq_lens, B=B, S=S), B=B, S=S, H=H, HKV=HKV, D=D, dtype=dtype),

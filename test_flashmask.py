@@ -7,6 +7,8 @@ import paddle
 try:
     from flash_mask.cute.interface import flashmask_attention
 except (ImportError, ModuleNotFoundError):
+    # Note(umiswing): comment it out if you really want to test in the old way
+    assert False
     from paddle.nn.functional.flash_attention import flashmask_attention
 
 from generate_startend_row_indices import (
@@ -21,7 +23,8 @@ from generate_startend_row_indices import (
   generate_prefix_lm_document_mask,
   generate_prefix_lm_causal_mask,
   generate_qk_sparse_mask,
-  generate_random_eviction_mask
+  generate_random_eviction_mask,
+  generate_empty_mask,
 )
 from functools import partial
 from test_util import attention_ref
@@ -45,8 +48,8 @@ shape_cases = (
         (2, 3000, 3000, 4, 1),
         (1, 4000, 4000, 1, 1),
         (1, 8192, 32768+1024, 2, 1),
-        (1, 8192, 16384+1024, 2, 1)
-        # my case
+        (1, 8192, 16384+1024, 2, 1),
+        (2, 7600, 7600, 32, 8),
     ]
     # tridao case
     + list(itertools.product(
@@ -81,6 +84,7 @@ def generate_shapes():
 @pytest.mark.parametrize("fa_version", [2, 3, 4])
 @pytest.mark.parametrize("d, dv",
     [
+        (32, 32),
         (64, 64),
         (80, 80),
         (128, 128),
@@ -106,6 +110,7 @@ def generate_shapes():
         partial(generate_prefix_lm_causal_mask), # prefix lm causal mask
         partial(generate_qk_sparse_mask), # qk-sparse mask
         partial(generate_random_eviction_mask), # random eviction mask
+        partial(generate_empty_mask),
     ],
 )
 def test_flashmask(
@@ -135,14 +140,11 @@ def test_flashmask(
 
     startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
-    if startend_row_indices is None and causal and d == 80:
-      pytest.skip(f"Skipping because running headdim 80 with flash_attn in causal mask")
+    if fa_version == 4 and seqlen_q != seqlen_k and causal and d > 128:
+      pytest.skip(f"Skipping because running fa4 and {d=} > 128 and {seqlen_q=} {seqlen_k} {causal=}")
 
     if fa_version == 2 and seqlen_q != seqlen_k and causal:
       pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
-
-    if fa_version == 4 and d != 128 and d != 64 and seqlen_q != seqlen_k and causal:
-      pytest.skip(f"Skipping because running fa4 in causal when seqlen_q != seqlen_k and d not int [128, 64]")
 
     if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
       pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")

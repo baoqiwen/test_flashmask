@@ -14,7 +14,10 @@ from generate_startend_row_indices import (
     generate_prefix_lm_causal_mask,
     generate_sliding_window_mask
 )
-from paddle.nn.functional.flash_attention import flashmask_attention
+try:
+    from flash_mask.cute.interface import flashmask_attention
+except (ImportError, ModuleNotFoundError):
+    from paddle.nn.functional.flash_attention import flashmask_attention
 
 func_map = {
     "global_swin": generate_global_sliding_window_mask,
@@ -53,6 +56,7 @@ def parse_args():
         default="global_swin",
         help="Available profiling mask types: global sliding window by default"
     )
+    parser.add_argument("--fm_version", type=int, default=1, help="specify FM/FA version")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -93,7 +97,11 @@ if __name__ == "__main__":
     else:
         startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
 
-    paddle.set_flags({'FLAGS_flash_attn_version': 3})
+    if opts.fm_version == 1:
+        paddle.set_flags({'FLAGS_flash_attn_version': 2})
+    else:
+        paddle.set_flags({'FLAGS_flash_attn_version': opts.fm_version})
+
     paddle.set_flags({'FLAGS_cudnn_deterministic': 0})
 
     print(f"Warming up run for {warmup_times} time(s)...")

@@ -85,7 +85,7 @@ def plot_radar(categories, save_path, methods,
                 val = values[i]
                 if show_value_labels:
                     if len(methods) == 1:
-                        ax.text(angle, val + outer_offset, f'{val:.1f}',
+                        ax.text(angle, val + outer_offset, f'{val:.3f}',
                                 color=color, fontsize=9, ha='center', va='center',
                                 fontproperties=font_prop,
                                 bbox=dict(boxstyle="round,pad=0.18", fc="w", ec=color, lw=0.6, alpha=0.85))
@@ -159,6 +159,7 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
     print("Drawing radar plot with : ", methods)
     
     root_dir = '.'
+    # for kernel in ["fwd", "bwd", "total", "fwd_time", "bwd_time", "total_time", "sparsity"]:
     for kernel in ["fwd", "bwd", "total"]:
         for dtype in ['bf16']:
             for headdim in [64, 128, 256]:
@@ -182,10 +183,19 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                             metric = get_column_name(df, 'BW TFLOPs/s')
                         elif kernel == "total":
                             metric = get_column_name(df, 'TOTAL TFLOPs/s')
+                        elif kernel == "fwd_time":
+                            metric = get_column_name(df, 'FW Time (ms)')
+                        elif kernel == "bwd_time":
+                            metric = get_column_name(df, 'BW Time (ms)')
+                        elif kernel == "total_time":
+                            metric = get_column_name(df, 'TOTAL Time (ms)')
+                        elif kernel == "sparsity":
+                            metric = get_column_name(df, 'Sparsity')
                         else:
                             raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 
-                        columns_to_average = [metric, '  Sparsity']
+                        # columns_to_average = [metric, '  Sparsity']
+                        columns_to_average = [metric]
         
                         if not dataframes:
                             print(f"Warning: No data found for method {method}, sequence length {seqlen}")
@@ -224,6 +234,14 @@ def main(methods: list = ["flashmaskv1", "flashmaskv3"]):
                         one_item['xlabel'] = 'Bwd Speed (TFLOPs/s)'
                     elif kernel == "total":
                         one_item['xlabel'] = 'Total Speed (TFLOPs/s)'
+                    elif kernel == "fwd_time":
+                        one_item['xlabel'] = 'FW Time (ms)'
+                    elif kernel == "bwd_time":
+                        one_item['xlabel'] = 'BW Time (ms)'
+                    elif kernel == "total_time":
+                        one_item['xlabel'] = 'TOTAL Time (ms)'
+                    elif kernel == "sparsity":
+                        one_item['xlabel'] = 'Sparsity'
                     else:
                         raise ValueError(f"kernel must be fwd or bwd, but got {kernel}")
 

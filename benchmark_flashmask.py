@@ -160,7 +160,9 @@ def test_mask(
                 startend_row_indices=startend_row_indices,
                 pack_gqa=False,
             )
+        # paddle.base.core.nvprof_nvtx_push("flashmask")
         fwd_time_ms = do_bench(flashmask_fwd)
+        # paddle.base.core.nvprof_nvtx_pop()
     else:
         fwd_time_ms = do_bench(flashmask)
 
@@ -187,7 +189,9 @@ def test_mask(
                 causal=causal,
             )
 
+        # paddle.base.core.nvprof_nvtx_push("flashmask")
         bwd_time_ms = do_bench(flashmask_bwd)
+        # paddle.base.core.nvprof_nvtx_pop()
     else:
         bwd_time_ms = do_bench(lambda: flashmask_out.backward(gradOut, retain_graph=True))
 
@@ -251,6 +255,10 @@ def flashmask_block_sparsity(
 
     Br = Q_BLOCK_SIZE
     Bc = KV_BLOCK_SIZE
+
+    # Note(umiswing): hack block size to seqlen when seqlen < block size, so the calculation code can reuse.
+    Br = min(Br, S)
+    Bc = min(Bc, SKV)
     
     if LTS is not None:
         B, H_mask, S = LTS.shape
@@ -745,7 +753,6 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 doc_list = eval(line.split(":")[-1].split("#")[0].strip())
                 qksparse_mask = eval(line.split(":")[-1].split("#")[1].strip())
                 doc_seq_lens_list.append((total_length, doc_list, qksparse_mask))
-            
         #doc_seq_lens_list = doc_seq_lens_list[::-1]
         for D in [128] if fm_version == 4 else [64, 128, 256]:
             H = 4096 // D
@@ -779,13 +786,13 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                     "Causal Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_document_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Share Question Mask": lambda: test_mask(generate_mask_fn=partial(generate_share_question_mask, doc_seq_lens=share_qa_docs), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # "Global Sliding Window": lambda: test_mask(generate_mask_fn=partial(generate_global_sliding_window_mask, global_token=16, window_size=(int(S*0.0625), int(S*0.0625))), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Causal Blockwise Mask": lambda: test_mask(generate_mask_fn=partial(generate_causal_blockwise_mask, doc_seq_lens=doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Prefix LM Document Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Prefix LM Causal Mask": lambda: test_mask(generate_mask_fn=partial(generate_prefix_lm_causal_mask, prefix_length=int(S*0.5)), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "QK-sparse Mask": lambda: test_mask(generate_mask_fn=partial(generate_qk_sparse_mask, maskout_pair=maskout_pair), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
                     "Random Eviction Mask": lambda: test_mask(generate_mask_fn=partial(generate_random_eviction_mask, start_row=S//2), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
-                    "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
+                    # "Hybrid SWA Prefix LM Doc": lambda: test_mask(generate_mask_fn=partial(generate_hybrid_swa_prefix_lm_document_mask, doc_seq_lens=prefix_doc_seq_lens), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
 
                     # Note(umiswing): support load mask and hybrid mask like this, and also, support simulate cp benchmark
                     # "Dumped Mask": lambda: test_mask(generate_mask_fn=partial(load_mask, path=mask_path, causal=False, cp_size=cp_size, cp_rank=cp_rank), B=B, S=SQ, SKV=SKV, H=H, HKV=HKV, D=D, dtype=dtype),
@@ -829,6 +836,8 @@ def main(examples: List[str] = ["all"], dtype='bf16', fm_version=1, suffix="_bas
                 )
                 content2=tabulate(results, headers=headers, tablefmt="tsv")
                 os.makedirs(f"{dtype}{suffix}", exist_ok=True)
+                # Note(umiswing): this file name is better, but i need to keep the old name for fig plotting
+                # text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{current_time}_{B}_{SQ}_{SKV}_{H}_{HKV}_{D}_{idx}.csv","w")
                 text_file = open(f"{dtype}{suffix}/flashmaskv{fm_version}_{current_time}_{B}_{S}_{H}_{HKV}_{D}_{idx}.csv","w")
                 text_file.write(content2)
                 text_file.close()

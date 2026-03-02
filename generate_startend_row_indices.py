@@ -37,6 +37,17 @@ def startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dt
 def generate_none_mask(batch_size, seqlen_q, seqlen_k, h, causal=True):
     return None, causal
 
+def generate_empty_mask(batch_size, seqlen_q, seqlen_k, h, causal=True):
+    assert causal
+    startend_row_indices = paddle.zeros([batch_size, h, seqlen_k, 1], dtype=paddle.int32)
+    # startend_row_indices = paddle.full(shape=[batch_size, h, seqlen_k, 1], fill_value=512, dtype=paddle.int32)
+    return startend_row_indices, causal
+
+def generate_load_mask(batch_size, seqlen_q, seqlen_k, h, causal=True):
+    np_mask = np.load("/path/to/startend_row_indices.npy")
+    startend_row_indices = paddle.to_tensor(np_mask)
+    return startend_row_indices, causal
+
 def generate_sliding_window_mask(batch_size, seqlen_q, seqlen_k, h, window_size=None):
     if window_size == None:
         window_size = 1024
