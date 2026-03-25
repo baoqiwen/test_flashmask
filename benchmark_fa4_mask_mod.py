@@ -268,13 +268,15 @@ def test_mask(
     lse = torch.empty(B, H, S, device=device, dtype=torch.float32)
 
     fa4_mask_mod_call = lambda: _flash_attn_fwd(
-        q=q, k=k, v=v, out=out, lse=lse,
+        q=q, k=k, v=v,
         softmax_scale=None, causal=causal,
-        m_block_size=tile_m, n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         mask_mod=cute_mask_mod, block_sparse_tensors=block_sparse_tensors_fwd,
-        aux_tensors=aux_tensors,
         return_lse=True,
         pack_gqa=pack_gqa,
+        out=out,
+        lse=lse,
+        aux_tensors=aux_tensors,
     )
 
     results = []
@@ -291,11 +293,12 @@ def test_mask(
         q=q,
         k=k,
         v=v,
-        m_block_size=tile_m, n_block_size=tile_n,
         out=out_cute,
         dout=gradOut,
         lse=lse_cute,
         causal=causal,
+        m_block_size=tile_m,
+        n_block_size=tile_n,
         mask_mod=cute_mask_mod,
         # Note(umiswing): idk how to pass aux tensors in bm of bwd
         block_sparse_tensors=block_sparse_tensors_bwd,
