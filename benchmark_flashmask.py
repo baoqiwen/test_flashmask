@@ -386,7 +386,7 @@ def generate_document_mask(B, S, H, D, doc_seq_lens=[2538, 1742, 3213]):
     for i in range(len(doc_seq_lens)):
         up_right_row_indices.extend([cur_len_so_far] * doc_seq_lens[i])
         if i < len(doc_seq_lens) -1:
-            cur_len_so_far += doc_seq_lens[i+1]
+            cur_len_so_far += doc_seq_lens[i]
     if padding > 0:
         up_right_row_indices.extend([cur_len_so_far] * padding)
     
