@@ -113,7 +113,7 @@ def generate_document_mask(batch_size, seqlen_q, seqlen_k, h, doc_seqlens=None):
     for i in range(len(doc_seqlens)):
         up_right_row_indices.extend([cur_len_so_far] * doc_seqlens[i])
         if i < len(doc_seqlens) -1:
-            cur_len_so_far += doc_seqlens[i+1]
+            cur_len_so_far += doc_seqlens[i]
     if padding > 0:
         up_right_row_indices.extend([cur_len_so_far] * padding)
     
