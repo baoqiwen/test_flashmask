@@ -35,7 +35,7 @@ shape_cases = (
         (2840, 32, 32, 16, 4),
         (1, 300, 300, 16, 16),
         # (2, 8192, 32768, 32, 4), # this will oom
-        # (2, 8192, 8192, 32, 4), # this will oom
+        # (2, 8192, 8192, 32, 4),  # this will oom
         (2, 8192, 8192, 14, 1),
         (2, 16384, 16384, 4, 1),
         (1, 1, 127, 1, 1),
@@ -62,11 +62,29 @@ shape_cases = (
     + list(itertools.product(
         [2],                # batch_size
         [4096, 4224],       # seqlen_q
-        [4096, 4224],      # seqlen_k
+        [4096, 4224],       # seqlen_k
         [6],                # nheads
         [6, 2, 1],          # nheads_kv
     ))
 )
+
+_shape_cases_before = len(shape_cases)
+shape_cases = list(dict.fromkeys(shape_cases))  # 保序去重
+print(f"{'='*60}")
+print(f"[test_flashmask] Shape Cases Summary:")
+print(f"  - Original Count: {_shape_cases_before}")
+print(f"  - Unique Count:   {len(shape_cases)}")
+print(f"  - Removed:        {_shape_cases_before - len(shape_cases)}")
+print(f"{'='*60}")
+
+d_dv_cases = [
+    (32, 32),
+    (64, 64),
+    (80, 80),
+    (128, 128),
+    (192, 192),
+    (256, 256),
+]
 
 # Generate all combinations for second param
 def generate_shapes():
@@ -82,15 +100,11 @@ def generate_shapes():
 
 @pytest.mark.parametrize("dtype", [paddle.bfloat16])
 @pytest.mark.parametrize("fa_version", [2, 3, 4])
-@pytest.mark.parametrize("d, dv",
-    [
-        (32, 32),
-        (64, 64),
-        (80, 80),
-        (128, 128),
-        (192, 192),
-        (256, 256),
-    ])
+@pytest.mark.parametrize(
+    "d, dv",
+    d_dv_cases,
+    ids=[f"d{c[0]}-dv{c[1]}" for c in d_dv_cases]
+)
 @pytest.mark.parametrize(
     "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
     list(generate_shapes())
@@ -118,6 +132,18 @@ def test_flashmask(
 ):
     paddle.seed(2024)
     assert nheads % nheads_kv == 0
+
+    startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
+
+    if fa_version == 4 and seqlen_q != seqlen_k and causal and d > 128:
+      pytest.skip(f"Skipping because running fa4 and {d=} > 128 and {seqlen_q=} {seqlen_k} {causal=}")
+
+    if fa_version == 2 and seqlen_q != seqlen_k and causal:
+      pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
+
+    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
+      pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
+
     q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
     k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
     v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
@@ -137,17 +163,6 @@ def test_flashmask(
     q.stop_gradient = False
     k.stop_gradient = False
     v.stop_gradient = False
-
-    startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
-
-    if fa_version == 4 and seqlen_q != seqlen_k and causal and d > 128:
-      pytest.skip(f"Skipping because running fa4 and {d=} > 128 and {seqlen_q=} {seqlen_k} {causal=}")
-
-    if fa_version == 2 and seqlen_q != seqlen_k and causal:
-      pytest.skip(f"Skipping because running fa2 in causal when seqlen_q != seqlen_k")
-
-    if fa_version == 4 and startend_row_indices is not None and startend_row_indices.shape[-1] == 4:
-      pytest.skip(f"Skipping because running fa4 when startend_row_indices.shape[-1] == 4")
 
     attn_bias = startend_row_indices_to_attn_bias(startend_row_indices, seqlen_q, nheads, dtype, causal)
 
